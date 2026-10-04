@@ -1,32 +1,5 @@
-
-
-Deployments
-Variables
-Metrics
-Console
-Settings
-Unexposed service
-US West
-1 Replica
--php
-/
-Crashed
-2026-10-04 15:37 GMT+8
-Get Help
-Filter and search logs
-You reached the start of the range
-2026-10-04 15:37
-AH00534: apache2: Configuration error: More than one MPM loaded.
-Starting Container
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-AH00534: apache2: Configuration error: More than one MPM loaded.
-You reached the end of the range
-2026-10-04 15:38
+FROM php:8.2-cli
+WORKDIR /app
+COPY . /app/
+EXPOSE 8080
+CMD ["php", "-S", "0.0.0.0:8080", "-t", "/app"]
