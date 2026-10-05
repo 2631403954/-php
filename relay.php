@@ -1,18 +1,27 @@
 <?php
 /**
- * relay.php —— 流式中继端 (v9)
+ * relay.php —— 流式中继端 (v10)
  *
- * v9 变更（在 v8 基础上收尾）：
- *   - [🔴] 重定向后重置 is_html / type，避免 zip/mp4 被当作 HTML 缓冲 64KB
- *   - [🟠] 挑战缓冲上限 CHALLENGE_MAX_LEN = 1MB，防上游超大 HTML 撑爆内存
- *   - [🟡] CURLOPT_PREREQFUNCTION 声明全 5 个参数（PHP 8.2+ 签名）
- *   - [🟡] 请求头加 "Expect:" 禁用 100-continue，避免 POST 大 body 时 1s 延迟
- *   - [🟡] relay_secret.php 返回值类型错误时给出明确 500 提示
+ * v10 变更（人机验证参数双向传递）：
+ *   - [🔴] 新增 challenge_cookie（别名 cookie）：调用方把已解出的验证 cookie
+ *          （如 __test=xxx）交给本端，本端原样发给上游。
+ *   - [🔴] Cookie 归一化：challenge_cookie + 服务端缓存 + headers 里的 Cookie
+ *          全部合并到一个 Cookie: 头，一次请求只发一个 Cookie 头。
+ *   - [🔴] 新增 challenge=auto|client
+ *   - [🟠] challenge=client 时挑战检测不再要求 Content-Type 是 text/html
+ *   - [🟡] 新增 cache_cookie=1
+ *
+ * 请求字段：
+ *   sign            必填
+ *   url             必填，仅 https
+ *   method          可选
+ *   headers         可选，JSON [["Name","Value"], ...]，最多 32 条
+ *   body_b64        可选
+ *   challenge_cookie 可选，要发给上游的 Cookie 值（如 __test=xxx）
+ *   challenge       可选，auto（默认）| client
+ *   cache_cookie    可选，1 表示把 challenge_cookie 整串按 host 缓存
  */
 
-/* ============================================================
- * 关闭所有输出缓冲
- * ============================================================ */
 @ini_set('output_buffering', '0');
 @ini_set('zlib.output_compression', '0');
 @ini_set('implicit_flush', '1');
@@ -23,9 +32,6 @@ if (function_exists('ini_set')) {
     @ini_set('zlib.output_compression_level', '-1');
 }
 
-/* ============================================================
- * 错误输出
- * ============================================================ */
 function relay_error($http_code, $msg) {
     if (!headers_sent()) {
         http_response_code($http_code);
@@ -36,9 +42,6 @@ function relay_error($http_code, $msg) {
     exit;
 }
 
-/* ============================================================
- * 密钥加载（fail loud）
- * ============================================================ */
 $relay_secret = getenv('RELAY_SECRET');
 if ($relay_secret === false || $relay_secret === '') {
     $cfg_file = __DIR__ . '/relay_secret.php';
@@ -47,7 +50,6 @@ if ($relay_secret === false || $relay_secret === '') {
         if (is_string($loaded) && $loaded !== '') {
             $relay_secret = $loaded;
         } else {
-            /* 明确告知，避免用户只看到 500 翻 error_log */
             relay_error(500, 'relay_secret.php must return a non-empty string');
         }
     }
@@ -61,23 +63,18 @@ if (!is_string($relay_secret) || $relay_secret === '') {
     }
 }
 
-/* ============================================================
- * 常量
- * ============================================================ */
 define('RELAY_SECRET',       $relay_secret);
 define('TIMEOUT',            3600);
 define('CONNECT_TIMEOUT',      10);
 define('CHALLENGE_TTL',       300);
 define('CHALLENGE_HTML_MAX', 64 * 1024);
-define('CHALLENGE_MAX_LEN',   1024 * 1024);   /* ★ v9：挑战缓冲 1MB 上限 */
+define('CHALLENGE_MAX_LEN',   1024 * 1024);
+define('COOKIE_MAX_LEN',      8 * 1024);
 define('LOW_SPEED_LIMIT',    1024);
 define('LOW_SPEED_TIME',       60);
 define('MAX_URL_LEN',        8192);
 define('MAX_RESP_HEADERS',    200);
 
-/* ============================================================
- * 工具
- * ============================================================ */
 function is_private_ip($ip) {
     if (!is_string($ip) || $ip === '') return true;
     return filter_var(
@@ -87,9 +84,6 @@ function is_private_ip($ip) {
     ) === false;
 }
 
-/* ============================================================
- * 挑战 cookie 缓存
- * ============================================================ */
 function challenge_cache_dir() {
     static $dir = null;
     if ($dir !== null) return $dir;
@@ -139,9 +133,6 @@ function challenge_cache_del($host) {
     @unlink(challenge_cache_path($host));
 }
 
-/* ============================================================
- * 挑战页识别 & 求解
- * ============================================================ */
 function looks_like_challenge($html) {
     if (!is_string($html) || $html === '') return false;
     if (strpos($html, 'slowAES.decrypt') !== false) return true;
@@ -175,9 +166,43 @@ function solve_challenge($html) {
     return '__test=' . bin2hex($decrypted);
 }
 
-/* ============================================================
- * 向客户端发送上游响应头
- * ============================================================ */
+function relay_clean_header_value($v, $max) {
+    if (!is_string($v)) return '';
+    $v = str_replace(["\r", "\n", "\0"], '', $v);
+    $v = trim($v);
+    if ($max > 0 && strlen($v) > $max) $v = substr($v, 0, $max);
+    return $v;
+}
+function relay_extract_test_cookie($cookie) {
+    if (!is_string($cookie) || $cookie === '') return '';
+    if (preg_match('/(?:^|;)\s*__test=([0-9a-fA-F]+)/', $cookie, $m)) {
+        return '__test=' . $m[1];
+    }
+    if (preg_match('/^[0-9a-fA-F]{16,64}$/', $cookie, $m)) {
+        return '__test=' . $m[0];
+    }
+    return '';
+}
+function relay_cache_client_cookie($host, $cookie, $cache_all) {
+    if (!is_string($cookie) || $cookie === '') return;
+    if ($cache_all) { challenge_cache_set($host, $cookie); return; }
+    $t = relay_extract_test_cookie($cookie);
+    if ($t !== '') challenge_cache_set($host, $t);
+}
+function relay_emit_challenge(&$state) {
+    if (empty($state['headers_sent'])) {
+        $state['headers'][] = ['X-Relay-Challenge', '1'];
+        $state['headers'][] = ['Cache-Control',      'no-store'];
+        emit_response_start($state);
+    }
+    if (!empty($state['buffered'])) {
+        echo $state['buffered'];
+        $state['buffered'] = '';
+    }
+    @flush();
+    exit;
+}
+
 function emit_response_start(&$state) {
     if (!empty($state['headers_sent'])) return;
 
@@ -185,8 +210,6 @@ function emit_response_start(&$state) {
         http_response_code($state['status'] > 0 ? $state['status'] : 502);
     }
 
-    /* Content-Encoding / Content-Length 必须丢：
-       curl 已自动解压（CURLOPT_ENCODING=''），客户端要拿明文。 */
     static $drop = [
         'connection', 'keep-alive', 'proxy-authenticate',
         'proxy-authorization', 'te', 'trailers',
@@ -204,32 +227,29 @@ function emit_response_start(&$state) {
     $state['headers_sent'] = true;
 }
 
-/* ============================================================
- * 核心：向 $url 发起请求，边收边转发
- * ============================================================ */
 function curl_fetch_stream($url, $cookie, $method, $body,
-                           $resolve_entries, $extra_headers, &$state) {
+                           $resolve_entries, $extra_headers, &$state,
+                           $client_cookie = '', $challenge_mode = 'auto') {
     $ch = curl_init();
 
     $state = [
-        'status'       => 0,
-        'headers'      => [],
-        'type'         => '',
-        'is_html'      => false,
-        'is_challenge' => false,
-        'buffered'     => '',
-        'headers_sent' => false,
-        'streaming'    => false,
+        'status'         => 0,
+        'headers'        => [],
+        'type'           => '',
+        'is_html'        => false,
+        'is_challenge'   => false,
+        'buffered'       => '',
+        'headers_sent'   => false,
+        'streaming'      => false,
+        'challenge_mode' => ($challenge_mode === 'client' ? 'client' : 'auto'),
     ];
 
-    /* ---- 响应头回调 ---- */
     $header_fn = function($ch, $line) use (&$state) {
         $len = strlen($line);
         $trimmed = rtrim($line, "\r\n");
         if ($trimmed === '') return $len;
 
         if (preg_match('#^HTTP/\S+\s+(\d+)#i', $trimmed, $m)) {
-            /* ★ v9：新响应开始（含重定向后）——彻底重置状态 */
             $state['status']  = (int)$m[1];
             $state['headers'] = [];
             $state['type']    = '';
@@ -254,13 +274,11 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         return $len;
     };
 
-    /* ---- 响应体回调：决定缓冲还是流式 ---- */
     $write_fn = function($ch, $data) use (&$state) {
         $len = strlen($data);
         if ($len === 0) return 0;
 
         if ($state['is_challenge']) {
-            /* ★ v9：挑战缓冲上限，防 OOM；超限直接中止 curl */
             if (strlen($state['buffered']) >= CHALLENGE_MAX_LEN) {
                 return 0;
             }
@@ -276,12 +294,17 @@ function curl_fetch_stream($url, $cookie, $method, $body,
 
         $state['buffered'] .= $data;
 
-        if ($state['is_html'] && looks_like_challenge($state['buffered'])) {
+        $client_mode = ($state['challenge_mode'] === 'client');
+        $detected = $client_mode
+                  ? looks_like_challenge($state['buffered'])
+                  : ($state['is_html'] && looks_like_challenge($state['buffered']));
+        if ($detected) {
             $state['is_challenge'] = true;
             return $len;
         }
 
-        $threshold = $state['is_html'] ? CHALLENGE_HTML_MAX : 1;
+        $threshold = $state['is_html'] ? CHALLENGE_HTML_MAX
+                                       : ($client_mode ? 8192 : 1);
         if (strlen($state['buffered']) >= $threshold) {
             emit_response_start($state);
             echo $state['buffered'];
@@ -292,7 +315,6 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         return $len;
     };
 
-    /* ---- 组装 curl 选项 ---- */
     $opts = [
         CURLOPT_URL             => $url,
         CURLOPT_FOLLOWLOCATION  => true,
@@ -303,8 +325,6 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         CURLOPT_LOW_SPEED_TIME  => LOW_SPEED_TIME,
         CURLOPT_SSL_VERIFYPEER  => true,
         CURLOPT_SSL_VERIFYHOST  => 2,
-        /* curl 自动加 Accept-Encoding 并自动解压；响应头里我们丢弃
-           Content-Encoding，客户端拿到的就是明文。 */
         CURLOPT_ENCODING        => '',
         CURLOPT_HEADERFUNCTION  => $header_fn,
         CURLOPT_WRITEFUNCTION   => $write_fn,
@@ -320,8 +340,6 @@ function curl_fetch_stream($url, $cookie, $method, $body,
           . 'Chrome/120.0.0.0 Safari/537.36',
     ];
 
-    /* 重定向目标私网地址拦截（libcurl >= 7.80 / PHP >= 8.2）
-       ★ v9：声明全 5 个参数，匹配 PHP 8.2+ 官方签名 */
     if (defined('CURLOPT_PREREQFUNCTION') && defined('CURL_PREREQFUNC_OK')) {
         $opts[CURLOPT_PREREQFUNCTION] = function(
             $ch, $primary_ip, $primary_port, $local_ip, $local_port
@@ -333,15 +351,28 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         };
     }
 
-    /* ★ v9：加 "Expect:" 禁 100-continue，避免 POST 大 body 时 1s 延迟 */
+    /* ★ Cookie 归一化：challenge_cookie + 服务端缓存 + headers 里的 Cookie
+       全部合并到一个 Cookie: 头（v9 是二选一，会丢浏览器 cookie）。 */
+    $cookie_parts = [];
+    if (is_string($client_cookie) && $client_cookie !== '') {
+        $cookie_parts[] = $client_cookie;
+    } elseif (is_string($cookie) && $cookie !== '') {
+        $cookie_parts[] = $cookie;
+    }
+
     $hdrs = ['Accept: */*', 'Expect:'];
-    if ($cookie) $hdrs[] = 'Cookie: ' . $cookie;
     foreach ($extra_headers as $h) {
+        if (strcasecmp($h[0], 'Cookie') === 0) {
+            if ($h[1] !== '') $cookie_parts[] = $h[1];
+            continue;
+        }
         $hdrs[] = $h[0] . ': ' . $h[1];
+    }
+    if (!empty($cookie_parts)) {
+        $hdrs[] = 'Cookie: ' . implode('; ', $cookie_parts);
     }
     $opts[CURLOPT_HTTPHEADER] = $hdrs;
 
-    /* 方法 */
     if ($method === 'HEAD') {
         $opts[CURLOPT_NOBODY] = true;
     } elseif ($method === 'GET') {
@@ -363,9 +394,6 @@ function curl_fetch_stream($url, $cookie, $method, $body,
     return [$ok, $errno, $err];
 }
 
-/* ============================================================
- * 收尾
- * ============================================================ */
 function finish_stream_response(&$state, $errno, $err) {
     if ($errno && empty($state['headers_sent']) && empty($state['streaming'])) {
         relay_error(502, 'upstream error: ' . $err);
@@ -380,9 +408,6 @@ function finish_stream_response(&$state, $errno, $err) {
     }
 }
 
-/* ============================================================
- * 请求校验
- * ============================================================ */
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     relay_error(405, 'method not allowed');
 }
@@ -409,9 +434,6 @@ if (empty($parts['host'])) {
 }
 $port = isset($parts['port']) ? (int)$parts['port'] : 443;
 
-/* ============================================================
- * host 预处理：IPv6 字面量去方括号
- * ============================================================ */
 $host = $parts['host'];
 $is_ip_literal = false;
 $hlen = strlen($host);
@@ -420,9 +442,6 @@ if ($hlen >= 2 && $host[0] === '[' && $host[$hlen - 1] === ']') {
     $is_ip_literal = true;
 }
 
-/* ============================================================
- * DNS 解析：优先系统缓存，IPv6 单独补
- * ============================================================ */
 $ips = [];
 if ($is_ip_literal) {
     if (!filter_var($host, FILTER_VALIDATE_IP)) {
@@ -449,9 +468,6 @@ foreach ($ips as $ip) {
     }
 }
 
-/* ============================================================
- * 可选字段
- * ============================================================ */
 $method = isset($_POST['method']) && is_string($_POST['method'])
         ? strtoupper(trim($_POST['method'])) : 'GET';
 if (!in_array($method, ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'], true)) {
@@ -484,9 +500,30 @@ if (isset($_POST['headers']) && is_string($_POST['headers'])) {
     }
 }
 
-/* ============================================================
- * 主流程
- * ============================================================ */
+$client_cookie = '';
+if (isset($_POST['challenge_cookie']) && is_string($_POST['challenge_cookie'])) {
+    $client_cookie = relay_clean_header_value($_POST['challenge_cookie'], COOKIE_MAX_LEN);
+} elseif (isset($_POST['cookie']) && is_string($_POST['cookie'])) {
+    $client_cookie = relay_clean_header_value($_POST['cookie'], COOKIE_MAX_LEN);
+}
+
+$cookie_in_headers = false;
+foreach ($extra_headers as $h) {
+    if (strcasecmp($h[0], 'Cookie') === 0 && $h[1] !== '') { $cookie_in_headers = true; break; }
+}
+
+$challenge_mode = 'auto';
+if (isset($_POST['challenge']) && is_string($_POST['challenge'])) {
+    $mode_in = strtolower(trim($_POST['challenge']));
+    if ($mode_in === 'client' || $mode_in === 'auto') $challenge_mode = $mode_in;
+}
+
+$cache_client_cookie = false;
+if (isset($_POST['cache_cookie']) && is_string($_POST['cache_cookie'])) {
+    $v = strtolower(trim($_POST['cache_cookie']));
+    $cache_client_cookie = ($v === '1' || $v === 'true' || $v === 'yes');
+}
+
 $host_lc = strtolower($host);
 
 $resolve_entries = [];
@@ -498,47 +535,73 @@ if (!$is_ip_literal) {
     $resolve_entries = [$host_lc . ':' . $port . ':' . implode(',', $addr_list)];
 }
 
-/* ---------- 第一次尝试：用缓存 cookie（如果有） ---------- */
-$cookie = challenge_cache_get($host_lc);
+$cookie = ($client_cookie !== '' || $cookie_in_headers)
+        ? null
+        : challenge_cache_get($host_lc);
 $state  = null;
 
-if ($cookie !== null) {
+if ($cookie !== null || $client_cookie !== '' || $cookie_in_headers) {
     list($ok, $errno, $err) =
         curl_fetch_stream($url, $cookie, $method, $req_body,
-                          $resolve_entries, $extra_headers, $state);
+                          $resolve_entries, $extra_headers, $state,
+                          $client_cookie, $challenge_mode);
 
     if ($state['is_challenge']) {
-        challenge_cache_del($host_lc);
+        if ($challenge_mode === 'client') {
+            if ($cookie !== null) challenge_cache_del($host_lc);
+            relay_emit_challenge($state);
+        }
+        if ($client_cookie !== '') {
+            $client_cookie = '';
+        } else {
+            challenge_cache_del($host_lc);
+            if ($cookie_in_headers) {
+                $kept = [];
+                foreach ($extra_headers as $h) {
+                    if (strcasecmp($h[0], 'Cookie') !== 0) $kept[] = $h;
+                }
+                $extra_headers    = $kept;
+                $cookie_in_headers = false;
+            }
+        }
         $cookie = null;
         $state  = null;
     } else {
+        relay_cache_client_cookie($host_lc, $client_cookie, $cache_client_cookie);
         finish_stream_response($state, $errno, $err);
         exit;
     }
 }
 
-/* ---------- 全新请求 ---------- */
 list($ok, $errno, $err) =
     curl_fetch_stream($url, null, $method, $req_body,
-                      $resolve_entries, $extra_headers, $state);
+                      $resolve_entries, $extra_headers, $state,
+                      '', $challenge_mode);
 
-/* 触发了挑战：解 cookie、缓存、重试 */
 if ($state['is_challenge']) {
+    if ($challenge_mode === 'client') {
+        relay_emit_challenge($state);
+    }
+
     $new_cookie = solve_challenge($state['buffered']);
     if ($new_cookie === null) {
-        relay_error(502, 'challenge detected but failed to solve');
+        relay_emit_challenge($state);
     }
     challenge_cache_set($host_lc, $new_cookie);
+
+    if (!headers_sent()) {
+        header('X-Relay-Cookie: ' . $new_cookie);
+    }
 
     $state = null;
     list($ok, $errno, $err) =
         curl_fetch_stream($url, $new_cookie, $method, $req_body,
-                          $resolve_entries, $extra_headers, $state);
+                          $resolve_entries, $extra_headers, $state,
+                          '', $challenge_mode);
 
     if ($state['is_challenge']) {
-        relay_error(502, 'challenge persists after cookie');
+        relay_emit_challenge($state);
     }
 }
 
-/* 收尾 */
 finish_stream_response($state, $errno, $err);
