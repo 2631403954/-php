@@ -8,7 +8,6 @@ const PORT          = 8080;
 const PHP_PORT      = 8081;
 const TUNNEL_SECRET = process.env.RELAY_SECRET || '314159265358979**//**';
 
-/* 启动 PHP 后端 */
 const php = spawn('php', ['-S', `127.0.0.1:${PHP_PORT}`, '-t', '/app'], { stdio: 'inherit' });
 php.on('exit', () => process.exit(1));
 process.on('SIGTERM', () => { php.kill(); process.exit(0); });
@@ -39,7 +38,6 @@ function safeEq(a, b) {
   try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
 }
 
-/* --------- HTTP 请求 → 反代到 PHP --------- */
 function proxyToPhp(req, res) {
   const p = http.request({
     hostname: '127.0.0.1', port: PHP_PORT,
@@ -53,7 +51,6 @@ const server = http.createServer((req, res) => {
   proxyToPhp(req, res);
 });
 
-/* --------- HTTP Upgrade → /tunnel 走裸 TCP 隧道 --------- */
 server.on('upgrade', (req, socket, head) => {
   const u = new URL(req.url, 'http://x');
   if (!u.pathname.startsWith('/tunnel')) {
@@ -92,7 +89,6 @@ server.on('upgrade', (req, socket, head) => {
         'Connection: Upgrade\r\n' +
         '\r\n'
       );
-      /* upgrade 事件里 Node 可能已经读了 head，先把它发给上游 */
       if (head && head.length) up.write(head);
       socket.pipe(up);
       up.pipe(socket);
