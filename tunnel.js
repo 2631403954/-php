@@ -8,6 +8,7 @@ const PORT          = 8080;
 const PHP_PORT      = 8081;
 const TUNNEL_SECRET = process.env.RELAY_SECRET || '314159265358979**//**';
 
+/* 启动 PHP 后端 */
 const php = spawn('php', ['-S', `127.0.0.1:${PHP_PORT}`, '-t', '/app'], { stdio: 'inherit' });
 php.on('exit', () => process.exit(1));
 process.on('SIGTERM', () => { php.kill(); process.exit(0); });
@@ -38,70 +39,121 @@ function safeEq(a, b) {
   try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
 }
 
-function proxyToPhp(req, res) {
-  const p = http.request({
-    hostname: '127.0.0.1', port: PHP_PORT,
-    path: req.url, method: req.method, headers: req.headers,
-  }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
-  p.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
-  req.pipe(p);
+/* 向 upgrade socket 返回错误 */
+function rejectUpgrade(socket, code, msg) {
+  try {
+    socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`);
+  } catch (e) {}
+  socket.destroy();
 }
 
-const server = http.createServer((req, res) => {
-  proxyToPhp(req, res);
-});
+/* --------- /tunnel：TCP 隧道（处理 Upgrade 请求） --------- */
+function handleTunnelUpgrade(req, socket, head) {
+  console.log(`[tunnel] UPGRADE event: url=${req.url} upgrade=${req.headers.upgrade}`);
 
-server.on('upgrade', (req, socket, head) => {
   const u = new URL(req.url, 'http://x');
-  if (!u.pathname.startsWith('/tunnel')) {
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-    return socket.destroy();
-  }
   const sign = u.searchParams.get('sign') || '';
   const host = u.searchParams.get('host') || '';
   const port = parseInt(u.searchParams.get('port') || '443', 10);
 
   if (!safeEq(sign, TUNNEL_SECRET)) {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-    return socket.destroy();
+    console.log('[tunnel] bad sign');
+    return rejectUpgrade(socket, 403, 'Forbidden');
   }
   if (!host || !port || port < 1 || port > 65535) {
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-    return socket.destroy();
+    console.log('[tunnel] bad host/port');
+    return rejectUpgrade(socket, 400, 'Bad Request');
   }
 
   dns.lookup(host, { all: true }, (err, addrs) => {
-    if (err || !addrs || !addrs.length) {
-      socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-      return socket.destroy();
+    if (err || !addrs) {
+      console.log(`[tunnel] dns fail: ${err && err.message}`);
+      return rejectUpgrade(socket, 502, 'Bad Gateway');
     }
     const good = addrs.filter(a => !isPrivateIP(a.address));
     if (!good.length) {
-      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      return socket.destroy();
+      console.log('[tunnel] private ip');
+      return rejectUpgrade(socket, 403, 'Forbidden');
     }
 
+    let connected = false;
     const up = net.connect(port, good[0].address, () => {
+      connected = true;
       console.log(`[tunnel] ${host}:${port} -> ${good[0].address}`);
+
+      // 关键：返回 101，Upgrade 必须是 websocket（配合 Railway 边缘）
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Upgrade: tcp\r\n' +
+        'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
         '\r\n'
       );
+
+      // 客户端在 Upgrade 请求后可能已发送的数据
       if (head && head.length) up.write(head);
+
       socket.pipe(up);
       up.pipe(socket);
-      const kill = () => { try{up.destroy();}catch{} try{socket.destroy();}catch{} };
-      socket.on('error', kill); socket.on('close', kill);
-      up.on('error', kill);     up.on('close', kill);
+
+      const kill = () => {
+        try { up.destroy(); } catch {}
+        try { socket.destroy(); } catch {}
+      };
+      socket.on('error', kill);
+      socket.on('close', kill);
+      up.on('error', kill);
+      up.on('close', kill);
     });
+
     up.setTimeout(0);
     up.on('error', (e) => {
-      console.log(`[tunnel] upstream error ${host}: ${e.message}`);
-      try { socket.destroy(); } catch {}
+      console.log(`[tunnel] upstream error: ${e.message}`);
+      if (!connected) {
+        if (!socket.destroyed) rejectUpgrade(socket, 502, 'Bad Gateway');
+      } else {
+        try { up.destroy(); } catch {}
+        try { socket.destroy(); } catch {}
+      }
     });
   });
+}
+
+/* --------- 其他请求 → 反代到 PHP --------- */
+function proxyToPhp(req, res) {
+  const p = http.request({
+    hostname: '127.0.0.1', port: PHP_PORT,
+    path: req.url, method: req.method, headers: req.headers,
+  }, (r) => {
+    res.writeHead(r.statusCode, r.headers);
+    r.pipe(res);
+  });
+  p.on('error', () => {
+    if (!res.headersSent) res.writeHead(502);
+    res.end();
+  });
+  req.pipe(p);
+}
+
+const server = http.createServer((req, res) => {
+  console.log(`[tunnel] REQUEST ${req.method} ${req.url} upgrade=${req.headers.upgrade || ''}`);
+
+  // 如果 /tunnel 走到普通请求，说明 Upgrade 头没被 Node 识别或已被剥离
+  if (req.url.startsWith('/tunnel')) {
+    res.writeHead(426, { 'Content-Type': 'text/plain', 'Connection': 'close' });
+    return res.end('Upgrade Required');
+  }
+
+  proxyToPhp(req, res);
+});
+
+/* 关键：监听 upgrade 事件 */
+server.on('upgrade', (req, socket, head) => {
+  if (req.url.startsWith('/tunnel')) {
+    handleTunnelUpgrade(req, socket, head);
+  } else {
+    console.log(`[tunnel] UPGRADE event for non-tunnel: ${req.url}`);
+    rejectUpgrade(socket, 404, 'Not Found');
+  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
