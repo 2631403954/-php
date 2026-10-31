@@ -1,25 +1,33 @@
 <?php
 /**
- * relay.php —— 流式中继端 (v10)
+ * relay.php —— 流式中继端 (v14)
  *
- * v10 变更（人机验证参数双向传递）：
- *   - [🔴] 新增 challenge_cookie（别名 cookie）：调用方把已解出的验证 cookie
- *          （如 __test=xxx）交给本端，本端原样发给上游。
- *   - [🔴] Cookie 归一化：challenge_cookie + 服务端缓存 + headers 里的 Cookie
- *          全部合并到一个 Cookie: 头，一次请求只发一个 Cookie 头。
- *   - [🔴] 新增 challenge=auto|client
- *   - [🟠] challenge=client 时挑战检测不再要求 Content-Type 是 text/html
- *   - [🟡] 新增 cache_cookie=1
+ * v14 变更（GitHub Cookie Jar + 过期清理 + 行数保险）：
+ *   - [🔴] relay 自己维护 github.com 的 Cookie Jar，浏览器完全不参与。
+ *         根除 GitHub Session 分裂导致的 422：_gh_sess 和 authenticity_token
+ *         永远来自 relay 同一套 jar。
+ *   - [🟡] 正确识别 Set-Cookie 的删除指令（Max-Age<=0 / Expires 过期 / 空值），
+ *         从 jar 里移除对应 key，不再残留失效 session。
+ *   - [🟡] jar 文件加 64 条上限保险，即使将来扩展到更多 host 也不会失控增长。
+ *   - [🟡] Set-Cookie 在 GitHub 分支只更新 jar，不透传给浏览器；
+ *          非 github.com 的 host 行为不变（继续透传）。
+ *
+ * v13 变更（不再自动跟随重定向）：
+ *   - [🔴] CURLOPT_FOLLOWLOCATION 改为 false。
+ *          GitHub 登录 POST /session 会先返回 302 -> /sessions/verified-device，
+ *          v12 里 curl 替浏览器自动 GET 了那个 Location，但内部跳转时
+ *          Referer / Cookie 上下文会出问题，GitHub 直接返回 404。
+ *          关闭 follow 后，302 + Location + Set-Cookie 会原样透传给客户端，
+ *          让浏览器自己跟随，行为与浏览器直连一致。
+ *
+ * v12 变更（修复多 Cookie 冲突导致 422）：
+ *   - [🔴] headers 里已包含 Cookie 时，不再拼接 challenge_cookie/服务端缓存。
+ *
+ * v11 变更：
+ *   - [🔴] Set-Cookie 改为追加，避免多个 Set-Cookie 只剩一个。
  *
  * 请求字段：
- *   sign            必填
- *   url             必填，仅 https
- *   method          可选
- *   headers         可选，JSON [["Name","Value"], ...]，最多 32 条
- *   body_b64        可选
- *   challenge_cookie 可选，要发给上游的 Cookie 值（如 __test=xxx）
- *   challenge       可选，auto（默认）| client
- *   cache_cookie    可选，1 表示把 challenge_cookie 整串按 host 缓存
+ *   sign / url / method / headers / body_b64 / challenge_cookie / challenge / cache_cookie
  */
 
 @ini_set('output_buffering', '0');
@@ -74,6 +82,7 @@ define('LOW_SPEED_LIMIT',    1024);
 define('LOW_SPEED_TIME',       60);
 define('MAX_URL_LEN',        8192);
 define('MAX_RESP_HEADERS',    200);
+define('GH_JAR_MAX_ROWS',      64);
 
 function is_private_ip($ip) {
     if (!is_string($ip) || $ip === '') return true;
@@ -131,6 +140,97 @@ function challenge_cache_del($host) {
     $key = challenge_cache_key($host);
     if (function_exists('apcu_delete')) @apcu_delete($key);
     @unlink(challenge_cache_path($host));
+}
+
+/* ================= GitHub Cookie Jar（仅 github.com） =================
+ *
+ * 设计目标：
+ *   1. 让 relay 成为 GitHub 眼中唯一的客户端，所有 GitHub Cookie 状态
+ *      由 relay 的 jar 文件统一维护，浏览器完全不参与。
+ *      → 根除 _gh_sess / authenticity_token 不一致导致的 422。
+ *   2. 正确处理 Set-Cookie 的删除指令（空值 / Max-Age<=0 / Expires 已过期），
+ *      避免过期 session 残留。
+ *   3. 加入行数上限保险，防止将来扩展到更多 host 时 jar 意外膨胀。
+ */
+function gh_jar_path($host) {
+    return challenge_cache_dir() . '/relay_jar_' . md5(strtolower($host)) . '.txt';
+}
+function gh_jar_load($host) {
+    $p = gh_jar_path($host);
+    if (!is_file($p)) return [];
+    $data = @file_get_contents($p);
+    if (!is_string($data) || $data === '') return [];
+    $out = [];
+    foreach (explode("\n", $data) as $line) {
+        $pos = strpos($line, '=');
+        if ($pos === false) continue;
+        $k = trim(substr($line, 0, $pos));
+        $v = trim(substr($line, $pos + 1));
+        if ($k !== '' && $v !== '') $out[$k] = $v;
+    }
+    return $out;
+}
+function gh_jar_save($host, $jar) {
+    /* 保险：即使 key 名无限增长也不会失控 */
+    if (count($jar) > GH_JAR_MAX_ROWS) {
+        $jar = array_slice($jar, -GH_JAR_MAX_ROWS, null, true);
+    }
+    $p   = gh_jar_path($host);
+    $tmp = $p . '.tmp.' . getmypid();
+    $lines = [];
+    foreach ($jar as $k => $v) {
+        if ($k === '' || $v === '') continue;
+        /* 防注入：键名不能含分隔符；值不能含 ; 或换行（值里允许 =） */
+        if (strpbrk($k, "\r\n;=") !== false) continue;
+        if (strpbrk($v, "\r\n;")  !== false) continue;
+        $lines[] = $k . '=' . $v;
+    }
+    @file_put_contents($tmp, implode("\n", $lines) . "\n", LOCK_EX);
+    @rename($tmp, $p);
+}
+function gh_jar_update_from_setcookie($host, $setcookie) {
+    // 1. 解析 name=value
+    $semi = strpos($setcookie, ';');
+    $pair = $semi === false ? $setcookie : substr($setcookie, 0, $semi);
+    $eq   = strpos($pair, '=');
+    if ($eq === false) return;
+    $k = trim(substr($pair, 0, $eq));
+    $v = trim(substr($pair, $eq + 1));
+    if ($k === '') return;
+
+    // 2. 判断是否为删除指令
+    $is_delete = ($v === '');
+    if (!$is_delete && $semi !== false) {
+        $attrs = substr($setcookie, $semi + 1);
+        // Max-Age=0 或负数 → 删除
+        if (preg_match('/Max-Age\s*=\s*(-?\d+)/i', $attrs, $m)) {
+            if ((int)$m[1] <= 0) $is_delete = true;
+        }
+        // Expires=过去时间 → 删除
+        if (!$is_delete && preg_match('/Expires\s*=\s*([^;]+)/i', $attrs, $m)) {
+            $ts = strtotime(trim($m[1]));
+            if ($ts !== false && $ts < time()) $is_delete = true;
+        }
+    }
+
+    $jar = gh_jar_load($host);
+    if ($is_delete) {
+        if (isset($jar[$k])) {
+            unset($jar[$k]);
+            gh_jar_save($host, $jar);
+        }
+        return;
+    }
+    // 防注入
+    if (strpbrk($k, "\r\n;=") !== false) return;
+    if (strpbrk($v, "\r\n;")  !== false) return;
+    $jar[$k] = $v;
+    gh_jar_save($host, $jar);
+}
+function gh_jar_to_cookie_header($jar) {
+    $parts = [];
+    foreach ($jar as $k => $v) $parts[] = $k . '=' . $v;
+    return implode('; ', $parts);
 }
 
 function looks_like_challenge($html) {
@@ -221,7 +321,9 @@ function emit_response_start(&$state) {
         $kl = strtolower($h[0]);
         if (in_array($kl, $drop, true)) continue;
         if (!headers_sent()) {
-            header($h[0] . ': ' . $h[1], true);
+            /* Set-Cookie 必须追加；其余（含 Location）可以替换 */
+            $replace = (strcasecmp($h[0], 'Set-Cookie') !== 0);
+            header($h[0] . ': ' . $h[1], $replace);
         }
     }
     $state['headers_sent'] = true;
@@ -229,7 +331,8 @@ function emit_response_start(&$state) {
 
 function curl_fetch_stream($url, $cookie, $method, $body,
                            $resolve_entries, $extra_headers, &$state,
-                           $client_cookie = '', $challenge_mode = 'auto') {
+                           $client_cookie = '', $challenge_mode = 'auto',
+                           $host_lc = '') {
     $ch = curl_init();
 
     $state = [
@@ -244,7 +347,7 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         'challenge_mode' => ($challenge_mode === 'client' ? 'client' : 'auto'),
     ];
 
-    $header_fn = function($ch, $line) use (&$state) {
+    $header_fn = function($ch, $line) use (&$state, $url, $host_lc) {
         $len = strlen($line);
         $trimmed = rtrim($line, "\r\n");
         if ($trimmed === '') return $len;
@@ -254,6 +357,7 @@ function curl_fetch_stream($url, $cookie, $method, $body,
             $state['headers'] = [];
             $state['type']    = '';
             $state['is_html'] = false;
+            error_log('relay: upstream status ' . $m[1] . ' for ' . $url);
             return $len;
         }
 
@@ -268,8 +372,24 @@ function curl_fetch_stream($url, $cookie, $method, $body,
                 $state['is_html'] = true;
             }
         }
+
+        /* ★ GitHub 专用：Set-Cookie 只更新 relay 的 jar，不透传给浏览器。
+           这样浏览器里 GitHub 的 cookie 会被清空，所有 session 状态由
+           relay 统一维护，_gh_sess 与 authenticity_token 必然一致。 */
+        if (strcasecmp($host_lc, 'github.com') === 0 &&
+            strcasecmp($name, 'Set-Cookie') === 0) {
+            gh_jar_update_from_setcookie($host_lc, $value);
+            error_log('relay: gh jar updated: ' . substr($value, 0, 200));
+            return $len;
+        }
+
         if (count($state['headers']) < MAX_RESP_HEADERS) {
             $state['headers'][] = [$name, $value];
+        }
+        if (strcasecmp($name, 'Location') === 0) {
+            error_log('relay: upstream Location: ' . substr($value, 0, 500));
+        } elseif (strcasecmp($name, 'Set-Cookie') === 0) {
+            error_log('relay: upstream Set-Cookie: ' . substr($value, 0, 200));
         }
         return $len;
     };
@@ -317,8 +437,8 @@ function curl_fetch_stream($url, $cookie, $method, $body,
 
     $opts = [
         CURLOPT_URL             => $url,
-        CURLOPT_FOLLOWLOCATION  => true,
-        CURLOPT_MAXREDIRS       => 5,
+        /* ★ v13：不自动跟随重定向，交给浏览器处理 */
+        CURLOPT_FOLLOWLOCATION  => false,
         CURLOPT_CONNECTTIMEOUT  => CONNECT_TIMEOUT,
         CURLOPT_TIMEOUT         => TIMEOUT,
         CURLOPT_LOW_SPEED_LIMIT => LOW_SPEED_LIMIT,
@@ -351,13 +471,39 @@ function curl_fetch_stream($url, $cookie, $method, $body,
         };
     }
 
-    /* ★ Cookie 归一化：challenge_cookie + 服务端缓存 + headers 里的 Cookie
-       全部合并到一个 Cookie: 头（v9 是二选一，会丢浏览器 cookie）。 */
+    /* ★ GitHub 专用 Cookie 组装：
+       - 丢弃浏览器/headers 里所有 Cookie，只用 relay 的 jar；
+       - 非 github.com 保持 v12 行为（headers 有 Cookie 时不再拼接缓存）。 */
+    $is_github = (strcasecmp($host_lc, 'github.com') === 0);
+
+    $headers_has_cookie = false;
+    foreach ($extra_headers as $h) {
+        if (strcasecmp($h[0], 'Cookie') === 0 && $h[1] !== '') {
+            $headers_has_cookie = true;
+            break;
+        }
+    }
+
     $cookie_parts = [];
-    if (is_string($client_cookie) && $client_cookie !== '') {
-        $cookie_parts[] = $client_cookie;
-    } elseif (is_string($cookie) && $cookie !== '') {
-        $cookie_parts[] = $cookie;
+    if ($is_github) {
+        $kept = [];
+        foreach ($extra_headers as $h) {
+            if (strcasecmp($h[0], 'Cookie') !== 0) $kept[] = $h;
+        }
+        $extra_headers      = $kept;
+        $headers_has_cookie = false;
+        $client_cookie      = '';
+        $jar      = gh_jar_load($host_lc);
+        $jar_cookie = gh_jar_to_cookie_header($jar);
+        if ($jar_cookie !== '') $cookie_parts[] = $jar_cookie;
+    } else {
+        if (!$headers_has_cookie) {
+            if (is_string($client_cookie) && $client_cookie !== '') {
+                $cookie_parts[] = $client_cookie;
+            } elseif (is_string($cookie) && $cookie !== '') {
+                $cookie_parts[] = $cookie;
+            }
+        }
     }
 
     $hdrs = ['Accept: */*', 'Expect:'];
@@ -544,7 +690,7 @@ if ($cookie !== null || $client_cookie !== '' || $cookie_in_headers) {
     list($ok, $errno, $err) =
         curl_fetch_stream($url, $cookie, $method, $req_body,
                           $resolve_entries, $extra_headers, $state,
-                          $client_cookie, $challenge_mode);
+                          $client_cookie, $challenge_mode, $host_lc);
 
     if ($state['is_challenge']) {
         if ($challenge_mode === 'client') {
@@ -576,7 +722,7 @@ if ($cookie !== null || $client_cookie !== '' || $cookie_in_headers) {
 list($ok, $errno, $err) =
     curl_fetch_stream($url, null, $method, $req_body,
                       $resolve_entries, $extra_headers, $state,
-                      '', $challenge_mode);
+                      '', $challenge_mode, $host_lc);
 
 if ($state['is_challenge']) {
     if ($challenge_mode === 'client') {
@@ -597,7 +743,7 @@ if ($state['is_challenge']) {
     list($ok, $errno, $err) =
         curl_fetch_stream($url, $new_cookie, $method, $req_body,
                           $resolve_entries, $extra_headers, $state,
-                          '', $challenge_mode);
+                          '', $challenge_mode, $host_lc);
 
     if ($state['is_challenge']) {
         relay_emit_challenge($state);

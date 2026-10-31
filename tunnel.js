@@ -8,8 +8,15 @@ const PORT          = 8080;
 const PHP_PORT      = 8081;
 const TUNNEL_SECRET = process.env.RELAY_SECRET || '314159265358979**//**';
 
-/* å¯åŠ¨ PHP åŽç«¯ */
-const php = spawn('php', ['-S', `127.0.0.1:${PHP_PORT}`, '-t', '/app'], { stdio: 'inherit' });
+/* ============================================================
+ * Æô¶¯ PHP ºó¶Ë
+ * ¼ÓÈë PHP_CLI_SERVER_WORKERS »·¾³±äÁ¿£¬¿ªÆô 8 ¸ö Worker
+ * ============================================================ */
+const php = spawn('php', ['-S', `127.0.0.1:${PHP_PORT}`, '-t', '/app'], { 
+    stdio: 'inherit',
+    env: { ...process.env, PHP_CLI_SERVER_WORKERS: '8' }
+});
+
 php.on('exit', () => process.exit(1));
 process.on('SIGTERM', () => { php.kill(); process.exit(0); });
 process.on('SIGINT',  () => { php.kill(); process.exit(0); });
@@ -39,121 +46,86 @@ function safeEq(a, b) {
   try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
 }
 
-/* å‘ upgrade socket è¿”å›žé”™è¯¯ */
-function rejectUpgrade(socket, code, msg) {
-  try {
-    socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`);
-  } catch (e) {}
-  socket.destroy();
+/* ============================================================
+ * ÆÕÍ¨ HTTP ÇëÇó·´Ïò´úÀíµ½ PHP (´¦Àí·ÇËíµÀÓòÃû)
+ * ¼ÓÈë setNoDelay(true) ¹Ø±Õ Nagle Ëã·¨
+ * ============================================================ */
+function proxyToPhp(req, res) {
+  if (req.socket) req.socket.setNoDelay(true);
+  if (res.socket) res.socket.setNoDelay(true);
+
+  const p = http.request({
+    hostname: '127.0.0.1', port: PHP_PORT,
+    path: req.url, method: req.method, headers: req.headers,
+  }, (r) => {
+    if (r.socket) r.socket.setNoDelay(true);
+    if (res.socket) res.socket.setNoDelay(true);
+    res.writeHead(r.statusCode, r.headers);
+    r.pipe(res);
+  });
+  p.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+  req.pipe(p);
 }
 
-/* --------- /tunnelï¼šTCP éš§é“ï¼ˆå¤„ç† Upgrade è¯·æ±‚ï¼‰ --------- */
-function handleTunnelUpgrade(req, socket, head) {
-  console.log(`[tunnel] UPGRADE event: url=${req.url} upgrade=${req.headers.upgrade}`);
+const server = http.createServer((req, res) => {
+  proxyToPhp(req, res);
+});
 
+/* ============================================================
+ * TCP ËíµÀ£¨HTTP Upgrade 101 Switching Protocols£©
+ * ÓÃÓÚ 2.c µÄ CONNECT ·½·¨£¬´¦Àí WebSocket »ò TCP ÂãÁ÷
+ * ============================================================ */
+server.on('upgrade', (req, socket, head) => {
   const u = new URL(req.url, 'http://x');
+  if (!u.pathname.startsWith('/tunnel')) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    return socket.destroy();
+  }
   const sign = u.searchParams.get('sign') || '';
   const host = u.searchParams.get('host') || '';
   const port = parseInt(u.searchParams.get('port') || '443', 10);
 
   if (!safeEq(sign, TUNNEL_SECRET)) {
-    console.log('[tunnel] bad sign');
-    return rejectUpgrade(socket, 403, 'Forbidden');
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    return socket.destroy();
   }
   if (!host || !port || port < 1 || port > 65535) {
-    console.log('[tunnel] bad host/port');
-    return rejectUpgrade(socket, 400, 'Bad Request');
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    return socket.destroy();
   }
 
   dns.lookup(host, { all: true }, (err, addrs) => {
-    if (err || !addrs) {
-      console.log(`[tunnel] dns fail: ${err && err.message}`);
-      return rejectUpgrade(socket, 502, 'Bad Gateway');
+    if (err || !addrs || !addrs.length) {
+      socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      return socket.destroy();
     }
     const good = addrs.filter(a => !isPrivateIP(a.address));
     if (!good.length) {
-      console.log('[tunnel] private ip');
-      return rejectUpgrade(socket, 403, 'Forbidden');
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      return socket.destroy();
     }
 
-    let connected = false;
     const up = net.connect(port, good[0].address, () => {
-      connected = true;
       console.log(`[tunnel] ${host}:${port} -> ${good[0].address}`);
-
-      // å…³é”®ï¼šè¿”å›ž 101ï¼ŒUpgrade å¿…é¡»æ˜¯ websocketï¼ˆé…åˆ Railway è¾¹ç¼˜ï¼‰
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\n' +
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
         '\r\n'
       );
-
-      // å®¢æˆ·ç«¯åœ¨ Upgrade è¯·æ±‚åŽå¯èƒ½å·²å‘é€çš„æ•°æ®
       if (head && head.length) up.write(head);
-
       socket.pipe(up);
       up.pipe(socket);
-
-      const kill = () => {
-        try { up.destroy(); } catch {}
-        try { socket.destroy(); } catch {}
-      };
-      socket.on('error', kill);
-      socket.on('close', kill);
-      up.on('error', kill);
-      up.on('close', kill);
+      const kill = () => { try{up.destroy();}catch{} try{socket.destroy();}catch{} };
+      socket.on('error', kill); socket.on('close', kill);
+      up.on('error', kill);     up.on('close', kill);
     });
-
     up.setTimeout(0);
     up.on('error', (e) => {
-      console.log(`[tunnel] upstream error: ${e.message}`);
-      if (!connected) {
-        if (!socket.destroyed) rejectUpgrade(socket, 502, 'Bad Gateway');
-      } else {
-        try { up.destroy(); } catch {}
-        try { socket.destroy(); } catch {}
-      }
+      console.log(`[tunnel] upstream error ${host}: ${e.message}`);
+      try { socket.destroy(); } catch {}
     });
   });
-}
-
-/* --------- å…¶ä»–è¯·æ±‚ â†’ åä»£åˆ° PHP --------- */
-function proxyToPhp(req, res) {
-  const p = http.request({
-    hostname: '127.0.0.1', port: PHP_PORT,
-    path: req.url, method: req.method, headers: req.headers,
-  }, (r) => {
-    res.writeHead(r.statusCode, r.headers);
-    r.pipe(res);
-  });
-  p.on('error', () => {
-    if (!res.headersSent) res.writeHead(502);
-    res.end();
-  });
-  req.pipe(p);
-}
-
-const server = http.createServer((req, res) => {
-  console.log(`[tunnel] REQUEST ${req.method} ${req.url} upgrade=${req.headers.upgrade || ''}`);
-
-  // å¦‚æžœ /tunnel èµ°åˆ°æ™®é€šè¯·æ±‚ï¼Œè¯´æ˜Ž Upgrade å¤´æ²¡è¢« Node è¯†åˆ«æˆ–å·²è¢«å‰¥ç¦»
-  if (req.url.startsWith('/tunnel')) {
-    res.writeHead(426, { 'Content-Type': 'text/plain', 'Connection': 'close' });
-    return res.end('Upgrade Required');
-  }
-
-  proxyToPhp(req, res);
-});
-
-/* å…³é”®ï¼šç›‘å¬ upgrade äº‹ä»¶ */
-server.on('upgrade', (req, socket, head) => {
-  if (req.url.startsWith('/tunnel')) {
-    handleTunnelUpgrade(req, socket, head);
-  } else {
-    console.log(`[tunnel] UPGRADE event for non-tunnel: ${req.url}`);
-    rejectUpgrade(socket, 404, 'Not Found');
-  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
